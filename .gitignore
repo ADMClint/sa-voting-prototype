@@ -1,0 +1,8 @@
+# Secrets and generated folders - never publish these
+supabase/.env
+frontend/.env.local
+.env.local
+dashboard/.streamlit/secrets.toml
+node_modules/
+.supabase/
+supabase/.temp/
