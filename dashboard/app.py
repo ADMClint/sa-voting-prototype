@@ -1,28 +1,23 @@
 # dashboard/app.py
-# Live public dashboard that reads the SAVoting contract directly from Ethereum Sepolia.
-# It never talks to our database or our API: everything shown comes from the blockchain.
+# Live public results dashboard. It reads the SAVoting contract directly from the blockchain
+# (never from our database or API). Look and feel lives in ui.py.
 import os
 import threading
+from datetime import datetime, timezone
 
-import altair as alt
 import pandas as pd
 import streamlit as st
 from web3 import Web3
 from web3.middleware import ExtraDataToPOAMiddleware
 
-st.set_page_config(page_title="SA Live Election Dashboard", page_icon="🗳️", layout="wide")
+import ui
 
-# Party order MUST match the ids used by the contract and the voter app.
-PARTIES = [
-    ("ANC", "#15803d"),
-    ("DA", "#1d4ed8"),
-    ("MK", "#111827"),
-    ("EFF", "#dc2626"),
-    ("IFP", "#b45309"),
-    ("FF Plus", "#ea580c"),
-    ("ActionSA", "#0e7490"),
-    ("PA", "#7e22ce"),
-]
+st.set_page_config(
+    page_title="SA Live Election Results",
+    page_icon="🗳️",
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
 
 LOG_CHUNK_SIZE = 2000   # public RPC nodes limit how many blocks one log query may span
 REFRESH_SECONDS = 5
@@ -59,7 +54,7 @@ class VoteLedger:
 
     def __init__(self, rpc_url, contract_address, start_block):
         self.w3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": 20}))
-        # Some chains (Polygon, BNB) add extra header bytes; this middleware is harmless on Sepolia and lets web3.py accept them elsewhere.
+        # Some chains (Polygon, BNB) add extra header bytes; this middleware is harmless on Sepolia.
         self.w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
         self.address = Web3.to_checksum_address(contract_address)
         self.contract = self.w3.eth.contract(address=self.address, abi=CONTRACT_ABI)
@@ -109,12 +104,17 @@ def get_ledger(rpc_url, contract_address, start_block):
     return VoteLedger(rpc_url, contract_address, start_block)
 
 
-def party_name(party_id):
-    return PARTIES[party_id][0] if party_id < len(PARTIES) else f"Party {party_id}"
+def local_time_text():
+    """Current time in South Africa (falls back to UTC if the timezone database is missing)."""
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo("Africa/Johannesburg")).strftime("%H:%M:%S SAST")
+    except Exception:
+        return datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
 
 
-def party_color(party_id):
-    return PARTIES[party_id][1] if party_id < len(PARTIES) else "#64748b"
+def show(markup):
+    st.markdown(markup, unsafe_allow_html=True)
 
 
 # ---------------------------------------------------------------- configuration
@@ -123,9 +123,10 @@ rpc_url = get_setting("RPC_URL", "https://ethereum-sepolia-rpc.publicnode.com")
 contract_address = get_setting("CONTRACT_ADDRESS")
 start_block = int(get_setting("DEPLOY_BLOCK", "0"))
 explorer_url = get_setting("EXPLORER_URL", "https://sepolia.etherscan.io").rstrip("/")
+# Set SHOW_LEDGER = "false" in the secrets to hide transaction and token details from viewers.
+show_ledger = get_setting("SHOW_LEDGER", "true").strip().lower() != "false"
 
-st.title("🗳️ South Africa Live Election Dashboard")
-st.caption("Prototype. All numbers are read straight from the smart contract on the Ethereum Sepolia testnet.")
+show(ui.css())
 
 if not contract_address:
     st.error("CONTRACT_ADDRESS is not set. Add it to .streamlit/secrets.toml (or the Streamlit Cloud Secrets box).")
@@ -136,13 +137,6 @@ try:
 except Exception as exc:
     st.error(f"Could not connect to the blockchain: {exc}")
     st.stop()
-
-with st.sidebar:
-    st.header("Contract")
-    st.code(contract_address, language=None)
-    st.markdown(f"[View on Etherscan]({explorer_url}/address/{contract_address})")
-    st.write(f"Auto-refreshes every {REFRESH_SECONDS} seconds.")
-    st.write(f"Scanning from block {start_block}.")
 
 
 # ---------------------------------------------------------------- live view
@@ -160,54 +154,21 @@ def live_view():
         st.error(f"Blockchain read failed (will retry automatically): {exc}")
         return
 
-    st.subheader(election_name)
-
-    # ---- KPI cards
-    k1, k2, k3, k4 = st.columns(4)
-    k1.metric("Total ballots cast", f"{onchain_total:,}")
-    k2.metric("Voter tokens authorized", f"{authorized_count:,}")
-    k3.metric("Avg block confirmation time", f"{block_time:.2f} s", help="Average seconds between the latest 50 blocks")
-    k4.metric("Election status", "OPEN" if election_open else "CLOSED")
-
-    # ---- tally table (authoritative numbers come from contract state)
+    # ---- build one row per party: logo, votes and share
     rows = []
     for party_id, votes in enumerate(onchain_tally):
         share = (votes / onchain_total * 100) if onchain_total else 0.0
-        rows.append({"Party": party_name(party_id), "Votes": int(votes), "Share": round(share, 2)})
-    tally_df = pd.DataFrame(rows)
+        rows.append({"id": party_id, "party": ui.party_meta(party_id), "votes": int(votes), "share": share})
+    ranked_rows = sorted(rows, key=lambda r: (-r["votes"], r["id"]))
 
-    chart_left, chart_right = st.columns([3, 2])
-
-    with chart_left:
-        st.markdown("#### National vote share")
-        bar_chart = (
-            alt.Chart(tally_df)
-            .mark_bar()
-            .encode(
-                x=alt.X("Party:N", sort="-y", title=None),
-                y=alt.Y("Share:Q", title="Vote share (%)"),
-                color=alt.Color(
-                    "Party:N",
-                    scale=alt.Scale(
-                        domain=[party_name(i) for i in range(len(onchain_tally))],
-                        range=[party_color(i) for i in range(len(onchain_tally))],
-                    ),
-                    legend=None,
-                ),
-                tooltip=["Party", "Votes", alt.Tooltip("Share:Q", format=".2f", title="Share %")],
-            )
-            .properties(height=360)
-        )
-        st.altair_chart(bar_chart, use_container_width=True)
-
-    with chart_right:
-        st.markdown("#### Results table")
-        st.dataframe(
-            tally_df.sort_values("Votes", ascending=False),
-            hide_index=True,
-            use_container_width=True,
-            column_config={"Share": st.column_config.NumberColumn("Share %", format="%.2f")},
-        )
+    # ---- banner and headline numbers
+    show(ui.banner(election_name, onchain_total))
+    show(ui.kpis([
+        ("Total ballots cast", ui.fmt_int(onchain_total)),
+        ("Voter tokens authorized", ui.fmt_int(authorized_count)),
+        ("Avg block confirmation time", f"{block_time:.2f} s"),
+        ("Election status", "OPEN" if election_open else "CLOSED"),
+    ]))
 
     # ---- integrity check: log-derived tally vs contract state
     log_tally = [0] * len(onchain_tally)
@@ -215,38 +176,43 @@ def live_view():
         if event["party_id"] < len(log_tally):
             log_tally[event["party_id"]] += 1
     if log_tally == list(onchain_tally):
-        st.success(f"Integrity check passed: {len(ledger.events):,} VoteCast logs match the contract's stored tally.")
+        show(ui.status(True, f"Integrity check passed: {ui.fmt_int(len(ledger.events))} VoteCast logs match the contract's stored tally."))
     else:
-        st.warning("Event logs and contract state differ right now. This usually means a new block is still being indexed.")
+        show(ui.status(False, "Event logs and contract state differ right now. This usually means a new block is still being indexed."))
 
-    # ---- votes over time + latest ledger entries
+    # ---- party results (logos beside votes) and the column chart (logos on bars)
+    left, right = st.columns([3, 2])
+    with left:
+        show(ui.results_table(ranked_rows))
+    with right:
+        show(ui.column_chart(rows))  # keeps ballot order so the chart does not jump around
+
+    # ---- ballots over time
     if ledger.events:
         events_df = pd.DataFrame(ledger.events).sort_values("timestamp")
         events_df["time"] = pd.to_datetime(events_df["timestamp"], unit="s", utc=True)
         events_df["Cumulative ballots"] = range(1, len(events_df) + 1)
 
-        timeline_col, feed_col = st.columns([2, 3])
-        with timeline_col:
-            st.markdown("#### Ballots over time")
-            st.line_chart(events_df.set_index("time")["Cumulative ballots"], height=300)
+        st.markdown("#### Ballots over time")
+        st.line_chart(events_df.set_index("time")["Cumulative ballots"], height=260)
 
-        with feed_col:
-            st.markdown("#### Latest ledger entries")
-            latest_df = events_df.sort_values("timestamp", ascending=False).head(15).copy()
-            latest_df["Time (UTC)"] = latest_df["time"].dt.strftime("%Y-%m-%d %H:%M:%S")
-            latest_df["Party"] = latest_df["party_id"].map(party_name)
-            latest_df["Ballot token"] = latest_df["token"].map(lambda t: f"{t[:10]}-{t[-6:]}")
-            latest_df["Transaction"] = latest_df["tx_hash"].map(lambda h: f"{explorer_url}/tx/{h}")
-            st.dataframe(
-                latest_df[["block", "Time (UTC)", "Party", "Ballot token", "Transaction"]].rename(columns={"block": "Block"}),
-                hide_index=True,
-                use_container_width=True,
-                column_config={"Transaction": st.column_config.LinkColumn("Transaction", display_text="View")},
-            )
+        if show_ledger:
+            with st.expander("Audit ledger (technical details)"):
+                latest_df = events_df.sort_values("timestamp", ascending=False).head(15).copy()
+                latest_df["Time (UTC)"] = latest_df["time"].dt.strftime("%Y-%m-%d %H:%M:%S")
+                latest_df["Party"] = latest_df["party_id"].map(lambda i: ui.party_meta(i)["short"])
+                latest_df["Ballot token"] = latest_df["token"].map(lambda t: f"{t[:10]}-{t[-6:]}")
+                latest_df["Transaction"] = latest_df["tx_hash"].map(lambda h: f"{explorer_url}/tx/{h}")
+                st.dataframe(
+                    latest_df[["block", "Time (UTC)", "Party", "Ballot token", "Transaction"]].rename(columns={"block": "Block"}),
+                    hide_index=True,
+                    use_container_width=True,
+                    column_config={"Transaction": st.column_config.LinkColumn("Transaction", display_text="View")},
+                )
     else:
         st.info("No ballots have been cast yet. This page will update automatically when the first vote lands on-chain.")
 
-    st.caption(f"Latest block scanned: {latest_block:,}")
+    show(ui.footer(f"Last updated {local_time_text()}  |  Latest block {ui.fmt_int(latest_block)}  |  Refreshes every {REFRESH_SECONDS} seconds"))
 
 
 live_view()
