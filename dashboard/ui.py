@@ -228,5 +228,10 @@ def column_chart(rows):
     )
 
 
+def heading(text):
+    """A section heading in the dashboard's own colours, readable in light or dark browser themes."""
+    return f'<div class="panel-h" style="margin-top:20px">{html.escape(text)}</div>'
+
+
 def footer(updated_text):
     return f'<div class="foot">{html.escape(updated_text)}</div>'

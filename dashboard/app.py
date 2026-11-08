@@ -193,7 +193,7 @@ def live_view():
         events_df["time"] = pd.to_datetime(events_df["timestamp"], unit="s", utc=True)
         events_df["Cumulative ballots"] = range(1, len(events_df) + 1)
 
-        st.markdown("#### Ballots over time")
+        show(ui.heading("Ballots over time"))
         st.line_chart(events_df.set_index("time")["Cumulative ballots"], height=260)
 
         if show_ledger:
